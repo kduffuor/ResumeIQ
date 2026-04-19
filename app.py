@@ -282,10 +282,10 @@ with gr.Blocks(css=css, title="ResumeIQ") as demo:
         with gr.Column(scale=1):
             gr.Markdown("## Resume")
             
-            file_input = gr.File(
-                label="Upload (PDF or DOCX)",
-                file_types=[".pdf", ".docx"],
-                height=120
+            file_input = gr.UploadButton(
+            label="Upload PDF or DOCX",
+            file_types=[".pdf", ".docx"],
+            file_count="single"
             )
             
             gr.Markdown("— OR —")
