@@ -285,7 +285,6 @@ with gr.Blocks(css=css, title="ResumeIQ") as demo:
             file_input = gr.File(
                 label="Upload (PDF or DOCX)",
                 file_types=[".pdf", ".docx"],
-                file_count="single",
                 height=120
             )
             
@@ -340,4 +339,4 @@ with gr.Blocks(css=css, title="ResumeIQ") as demo:
     )
 
 if __name__ == "__main__":
-    demo.launch()
+    demo.launch(server_name="0.0.0.0", server_port=7860)
