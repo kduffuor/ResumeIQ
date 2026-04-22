@@ -1,9 +1,12 @@
 import gradio as gr
 import requests
 import os
+import re
 import fitz
 from docx import Document
 from dotenv import load_dotenv
+import hashlib
+import time
 
 # --- Load Environment Variables ---
 load_dotenv()
@@ -13,6 +16,14 @@ HF_API_TOKEN = os.getenv("HF_API_TOKEN")
 API_URL = "https://router.huggingface.co/v1/chat/completions"
 HEADERS = {"Authorization": f"Bearer {HF_API_TOKEN}"}
 MODEL = "meta-llama/Llama-3.1-8B-Instruct"
+
+# --- Cache for Deterministic Results ---
+_cache = {}
+
+def get_cache_key(text1, text2, prompt_type):
+    """Generate a cache key for consistent results"""
+    content = f"{prompt_type}:{text1[:1000]}:{text2[:1000]}"
+    return hashlib.md5(content.encode()).hexdigest()
 
 # --- Text Extraction ---
 def extract_text(file):
@@ -28,20 +39,29 @@ def extract_text(file):
     return ""
 
 # --- Query LLM ---
-def query_llm(prompt, max_tokens=600):
+def query_llm(prompt, max_tokens=600, cache_key=None):
+    # Check cache first for deterministic results
+    if cache_key and cache_key in _cache:
+        return _cache[cache_key]
+
     payload = {
         "model": MODEL,
         "messages": [{"role": "user", "content": prompt}],
         "max_tokens": max_tokens,
-        "temperature": 0.4
+        "temperature": 0.0  # Deterministic results
     }
     response = requests.post(API_URL, headers=HEADERS, json=payload)
     if response.status_code == 200:
-        return response.json()["choices"][0]["message"]["content"]
+        result = response.json()["choices"][0]["message"]["content"]
+        # Cache the result
+        if cache_key:
+            _cache[cache_key] = result
+        return result
     return f"API Error {response.status_code}: {response.text}"
 
 # --- ATS Score ---
 def get_ats_score(resume_text, job_text):
+    cache_key = get_cache_key(resume_text, job_text, "ats_score")
     prompt = f"""You are an ATS scoring system. Compare the resume to the job description.
 
 Return ONLY this format, nothing else:
@@ -50,19 +70,19 @@ SCORE: [number between 0 and 100]
 SUMMARY: [one sentence explaining the score]
 
 RESUME:
-{resume_text[:2000]}
+{resume_text[:3000]}
 
 JOB DESCRIPTION:
-{job_text[:1500]}"""
+{job_text[:2000]}"""
 
-    result = query_llm(prompt, max_tokens=100)
+    result = query_llm(prompt, max_tokens=100, cache_key=cache_key)
     score = 0
     summary = ""
 
     for line in result.splitlines():
         if line.startswith("SCORE:"):
             try:
-                score = int("".join(filter(str.isdigit, line.split(":", 1)[1])))
+                score = min(int("".join(filter(str.isdigit, line.split(":", 1)[1]))), 100)
             except:
                 score = 0
         if line.startswith("SUMMARY:"):
@@ -72,52 +92,77 @@ JOB DESCRIPTION:
 
 # --- Keyword Analysis ---
 def get_keywords(resume_text, job_text):
-    prompt = f"""You are an ATS keyword analyst.
+    cache_key = get_cache_key(resume_text, job_text, "keywords")
+    prompt = f"""You are an ATS keyword analyst. Extract the TOP 10 most important technical skills, tools, methodologies, and role-specific competencies from the job description. Focus on:
 
-Return ONLY this format, nothing else:
+1. Technical skills (programming languages, frameworks, databases)
+2. Tools and software
+3. Methodologies (Agile, Scrum, DevOps)
+4. Industry-specific terms
+5. Certifications and qualifications
+
+IMPORTANT: Return exactly 10 keywords maximum, ranked by importance. Do not include education degrees, company names, or generic soft skills.
+
+From the JOB DESCRIPTION below, extract the most important keywords. Then check which ones appear in the RESUME.
+
+Return ONLY this exact format, nothing else:
 
 MATCHED: keyword1, keyword2, keyword3
 MISSING: keyword1, keyword2, keyword3
 
-RESUME:
-{resume_text[:2000]}
-
 JOB DESCRIPTION:
-{job_text[:1500]}"""
+{job_text[:2000]}
 
-    result = query_llm(prompt, max_tokens=150)
+RESUME:
+{resume_text[:3000]}"""
+
+    result = query_llm(prompt, max_tokens=200, cache_key=cache_key)
     matched = ""
     missing = ""
 
     for line in result.splitlines():
+        line = line.strip()
         if line.startswith("MATCHED:"):
-            matched = line.split(":", 1)[1].strip()
+            matched = line.replace("MATCHED:", "").strip()
         if line.startswith("MISSING:"):
-            missing = line.split(":", 1)[1].strip()
+            missing = line.replace("MISSING:", "").strip()
 
     return matched, missing
 
-# --- Suggestions ---
-def get_suggestions(resume_text, job_text):
+# --- Improvement Suggestions ---
+def get_suggestions(resume_text, job_text, matched_keywords=""):
+    cache_key = get_cache_key(resume_text + matched_keywords, job_text, "suggestions")
+    
+    matched_list = ", ".join([k.strip() for k in matched_keywords.split(",") if k.strip()])
+    matched_info = f"KEYWORDS ALREADY MATCHED IN RESUME:\n{matched_list}\n\n" if matched_list else ""
+    
     prompt = f"""You are a professional resume coach presenting to an executive audience.
 
-Analyze the resume against the job description and return exactly 3 specific,
-actionable improvement suggestions.
+Analyze the resume against the job description and return exactly 3 specific, actionable improvement suggestions.
 
-Use this format exactly for each suggestion:
-**1. [Short title]:** [One to two sentence explanation in plain prose.]
-**2. [Short title]:** [One to two sentence explanation in plain prose.]
-**3. [Short title]:** [One to two sentence explanation in plain prose.]
+{matched_info}CRITICAL RULES - READ CAREFULLY:
+1. ONLY suggest improvements for skills that are COMPLETELY MISSING from the resume.
+2. NEVER recommend any of these matched keywords: {matched_list if matched_list else "(none)"}
+3. Do NOT recommend anything from the matched keywords list - the resume already has these.
+4. Focus ONLY on gaps that the job description requires but the resume completely lacks.
+5. If the resume mentions experience that meets or exceeds a requirement, do NOT recommend it.
+6. If there are fewer than 3 true gaps, suggest ways to strengthen presentation or impact.
 
-Do not add any text before or after the three suggestions.
+Use this format exactly. Each suggestion must start with the number, followed by a short title in bold, then a colon, then one to two sentences of explanation:
+
+**1. Short Title:** Explanation here.
+**2. Short Title:** Explanation here.
+**3. Short Title:** Explanation here.
+
+Do not add any text before or after the three suggestions. Do not use asterisks anywhere except for the bold titles.
 
 RESUME:
-{resume_text[:2000]}
+{resume_text[:3000]}
 
 JOB DESCRIPTION:
-{job_text[:1500]}"""
+{job_text[:2000]}"""
 
-    return query_llm(prompt, max_tokens=300)
+    return query_llm(prompt, max_tokens=400, cache_key=cache_key)
 
 # --- Score Display ---
 def score_display(score, summary):
@@ -133,7 +178,7 @@ def score_display(score, summary):
 
     return f"""
     <div style="border:1px solid #e0e0e0; border-radius:8px; padding:24px;
-                margin-bottom:16px; background:#fafafa;">
+                margin-bottom:16px; background:#fafafa; text-align:left;">
         <div style="display:flex; align-items:center; gap:24px;">
             <div style="text-align:center; flex-shrink:0;">
                 <div style="font-size:48px; font-weight:700; color:{color};
@@ -151,9 +196,12 @@ def score_display(score, summary):
 
 # --- Keyword Display ---
 def keyword_display(matched, missing):
-    html = '<div style="border:1px solid #e0e0e0; border-radius:8px; padding:20px; margin-bottom:16px;">'
+    def is_empty(val):
+        return not val or val.strip().lower() in ("", "none", "n/a")
 
-    if matched:
+    html = '<div style="border:1px solid #e0e0e0; border-radius:8px; padding:20px; margin-bottom:16px; text-align:left;">'
+
+    if not is_empty(matched):
         html += '<div style="margin-bottom:16px;">'
         html += '<div style="font-weight:700; margin-bottom:10px; color:#00C4B4; font-size:14px;">Matched Keywords</div>'
         html += '<div style="display:flex; flex-wrap:wrap; gap:8px;">'
@@ -161,7 +209,7 @@ def keyword_display(matched, missing):
             html += f'<span style="background:#e8faf9; color:#00C4B4; padding:4px 12px; border-radius:4px; font-size:13px; border:1px solid #00C4B4;">{kw}</span>'
         html += '</div></div>'
 
-    if missing:
+    if not is_empty(missing):
         html += '<div>'
         html += '<div style="font-weight:700; margin-bottom:10px; color:#FF6B6B; font-size:14px;">Missing Keywords</div>'
         html += '<div style="display:flex; flex-wrap:wrap; gap:8px;">'
@@ -171,54 +219,54 @@ def keyword_display(matched, missing):
 
     html += '</div>'
 
-    if not matched and not missing:
-        return '<div style="border:1px solid #e0e0e0; border-radius:8px; padding:20px; color:#aaa;">No keywords analyzed yet.</div>'
+    if is_empty(matched) and is_empty(missing):
+        return '<div style="border:1px solid #e0e0e0; border-radius:8px; padding:20px; color:#aaa; text-align:left;">No keywords analyzed yet.</div>'
+
     return html
 
 # --- Suggestions Display ---
 def suggestions_display(text):
     if not text or text.startswith("Please provide"):
-        return '<div style="border:1px solid #e0e0e0; border-radius:8px; padding:20px; color:#aaa;">Suggestions will appear after analysis.</div>'
+        return '<div style="border:1px solid #e0e0e0; border-radius:8px; padding:20px; color:#aaa; text-align:left;">Suggestions will appear after analysis.</div>'
 
-    import re
+    text = text.strip()
     text = re.sub(r'\*\*(.+?)\*\*', r'<strong>\1</strong>', text)
+    text = text.replace('\n', ' ')
+    parts = re.split(r'(?=\s*[2-9]\.\s)', text)
+    text = '<br><br>'.join(p.strip() for p in parts if p.strip())
 
-    return f"""
-    <div style="border:1px solid #e0e0e0; border-radius:8px; padding:20px;">
-        <div style="font-weight:700; margin-bottom:14px; color:#00C4B4; font-size:14px;">
-            Improvement Recommendations
-        </div>
-        <div style="color:#444; line-height:1.8; font-size:14px;">
-            {text.replace(chr(10), "<br>")}
-        </div>
-    </div>
-    """
+    return f'<div style="border:1px solid #e0e0e0; border-radius:8px; padding:20px; text-align:left;"><div style="font-weight:700; margin:0; color:#00C4B4; font-size:14px;">Improvement Recommendations</div><div style="color:#444; line-height:1.8; font-size:14px; margin-top:5px;">{text}</div></div>'
+
+# --- Loading State ---
+def loading_state():
+    loading_html = '<div style="border:1px solid #e0e0e0; border-radius:8px; padding:20px; color:#F97316; text-align:left; font-size:14px;">Analyzing... please wait.</div>'
+    return loading_html, loading_html, loading_html
 
 # --- Main Analysis ---
 def analyze(resume_file, resume_paste, job_description):
-    # Check if file was uploaded
+    time.sleep(1)
     if resume_file is not None:
         resume_text = extract_text(resume_file)
     else:
         resume_text = resume_paste.strip() if resume_paste else ""
-    
+
     if not resume_text:
         return (
-            '<div style="border:1px solid #FF6B6B; border-radius:8px; padding:20px; background:#fff0f0; color:#FF6B6B;">Please upload a resume file or paste your resume text.</div>',
-            '<div style="border:1px solid #e0e0e0; border-radius:8px; padding:20px; color:#aaa;">Awaiting resume input...</div>',
-            '<div style="border:1px solid #e0e0e0; border-radius:8px; padding:20px; color:#aaa;">Awaiting resume input...</div>'
+            '<div style="border:1px solid #FF6B6B; border-radius:8px; padding:20px; background:#fff0f0; color:#FF6B6B; text-align:left;">Please upload a resume file or paste your resume text.</div>',
+            '<div style="border:1px solid #e0e0e0; border-radius:8px; padding:20px; color:#aaa; text-align:left;">Awaiting resume input...</div>',
+            '<div style="border:1px solid #e0e0e0; border-radius:8px; padding:20px; color:#aaa; text-align:left;">Awaiting resume input...</div>'
         )
 
     if not job_description or not job_description.strip():
         return (
-            '<div style="border:1px solid #FF6B6B; border-radius:8px; padding:20px; background:#fff0f0; color:#FF6B6B;">Please paste a job description.</div>',
-            '<div style="border:1px solid #e0e0e0; border-radius:8px; padding:20px; color:#aaa;">Awaiting job description...</div>',
-            '<div style="border:1px solid #e0e0e0; border-radius:8px; padding:20px; color:#aaa;">Awaiting job description...</div>'
+            '<div style="border:1px solid #FF6B6B; border-radius:8px; padding:20px; background:#fff0f0; color:#FF6B6B; text-align:left;">Please paste a job description.</div>',
+            '<div style="border:1px solid #e0e0e0; border-radius:8px; padding:20px; color:#aaa; text-align:left;">Awaiting job description...</div>',
+            '<div style="border:1px solid #e0e0e0; border-radius:8px; padding:20px; color:#aaa; text-align:left;">Awaiting job description...</div>'
         )
 
     score, summary = get_ats_score(resume_text, job_description)
     matched, missing = get_keywords(resume_text, job_description)
-    suggestions = get_suggestions(resume_text, job_description)
+    suggestions = get_suggestions(resume_text, job_description, matched)
 
     return (
         score_display(score, summary),
@@ -267,16 +315,31 @@ textarea:hover, input:hover {
     border-color: #F97316 !important;
 }
 
+.tab-nav button {
+    font-size: 13px !important;
+    font-weight: 500 !important;
+}
+
+.tab-nav button.selected {
+    border-bottom: 2px solid #F97316 !important;
+    color: #F97316 !important;
+}
+
 footer {
     display: none !important;
 }
+
+.gr-html, .gr-html > div {
+    text-align: left !important;
+}
+
 """
 
 # --- Gradio Interface ---
 with gr.Blocks(css=css, theme=gr.themes.Base(), title="ResumeIQ") as demo:
 
     gr.HTML("""
-        <div style="text-align:center; padding:32px 0 16px 0;">
+        <div style="text-align:center; padding:5px 0 5px 0;">
             <h1 style="font-size:42px; font-weight:800; margin-bottom:8px;
                        color:#1a1a1a; letter-spacing:-0.5px;">ResumeIQ</h1>
             <p style="font-size:16px; color:#555; margin-bottom:8px;">
@@ -296,7 +359,7 @@ with gr.Blocks(css=css, theme=gr.themes.Base(), title="ResumeIQ") as demo:
         # --- Left Panel ---
         with gr.Column(scale=1):
             gr.Markdown("## Resume")
-            
+
             with gr.Tabs():
                 with gr.TabItem("Upload File"):
                     resume_file = gr.File(
@@ -310,7 +373,7 @@ with gr.Blocks(css=css, theme=gr.themes.Base(), title="ResumeIQ") as demo:
                         lines=8,
                         placeholder="Paste your resume content here..."
                     )
-            
+
             gr.Markdown("## Job Description")
             job_input = gr.Textbox(
                 label="Job Description",
@@ -319,20 +382,40 @@ with gr.Blocks(css=css, theme=gr.themes.Base(), title="ResumeIQ") as demo:
             )
             analyze_btn = gr.Button("Analyze Resume", variant="primary")
 
+            gr.HTML("""
+                <div style="background:#f8f9fa; border-radius:8px; padding:16px;
+                            margin-top:16px; border:1px solid #e0e0e0;">
+                    <p style="font-weight:600; margin:0 0 10px 0; color:#333;
+                               font-size:14px;">💡 Tips for best results</p>
+                    <ul style="color:#666; font-size:13px; line-height:1.8; margin:0; padding-left:20px;">
+                        <li>Include complete work experience with dates</li>
+                        <li>List technical skills and tools you know</li>
+                        <li>Add measurable achievements (%, $, numbers)</li>
+                        <li>Tailor your resume to each job description</li>
+                        <li>Use standard headings: Experience, Skills, Education</li>
+                    </ul>
+                </div>
+            """)
+
         # --- Right Panel ---
         with gr.Column(scale=1):
             gr.Markdown("## Results")
             score_output = gr.HTML(
-                value='<div style="border:1px solid #e0e0e0; border-radius:8px; padding:20px; color:#aaa;">Run analysis to see your ATS match score.</div>'
+                value='<div style="border:1px solid #e0e0e0; border-radius:8px; padding:20px; color:#aaa; text-align:left;">See your ATS match score after running the analysis.</div>'
             )
             keywords_output = gr.HTML(
-                value='<div style="border:1px solid #e0e0e0; border-radius:8px; padding:20px; color:#aaa;">Get matched and missing keyword analysis.</div>'
+                value='<div style="border:1px solid #e0e0e0; border-radius:8px; padding:20px; color:#aaa; text-align:left;">Get your matched keywords and uncover what’s missing.</div>'
             )
             suggestions_output = gr.HTML(
-                value='<div style="border:1px solid #e0e0e0; border-radius:8px; padding:20px; color:#aaa;">Improve your resume with tailored suggestions.</div>'
+                value='<div style="border:1px solid #e0e0e0; border-radius:8px; padding:20px; color:#aaa; text-align:left;">Receive tailored suggestions to strengthen your resume.</div>'
             )
 
     analyze_btn.click(
+        fn=loading_state,
+        inputs=None,
+        outputs=[score_output, keywords_output, suggestions_output],
+        queue=False
+    ).then(
         fn=analyze,
         inputs=[resume_file, resume_text, job_input],
         outputs=[score_output, keywords_output, suggestions_output]
