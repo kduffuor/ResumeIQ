@@ -327,12 +327,54 @@ textarea:hover, input:hover {
 
 footer {
     display: none !important;
+    height: 0 !important;
+    overflow: hidden !important;
+    margin: 0 !important;
+    padding: 0 !important;
 }
 
-.gr-html, .gr-html > div {
-    text-align: left !important;
+footer * {
+    text-align: center !important;
 }
 
+.gr-markdown:last-of-type {
+    text-align: center !important;
+    width: 100% !important;
+    display: flex !important;
+    justify-content: center !important;
+}
+
+.gr-markdown:last-of-type div {
+    text-align: center !important;
+    width: 100% !important;
+}
+
+.gr-markdown:last-of-type,
+.gr-markdown:last-of-type *,
+.gr-markdown:last-child,
+.gr-markdown:last-child * {
+    text-align: center !important;
+    justify-content: center !important;
+    width: 100% !important;
+    margin: 0 !important;
+    padding: 0 !important;
+}
+
+#footer, #footer * {
+    text-align: center !important;
+    width: 100% !important;
+    margin: 0 !important;
+    padding: 0 !important;
+}
+
+#footer {
+    margin-bottom: 0 !important;
+    padding-bottom: 0px !important;
+}
+
+.gradio-container-6-13-0 {
+    flex-direction: row !important;
+}
 """
 
 # --- Gradio Interface ---
@@ -424,14 +466,14 @@ with gr.Blocks(css=css, theme=gr.themes.Base(), title="ResumeIQ") as demo:
     gr.Markdown("---")
 
     gr.Markdown("""
-    <div style="text-align:center; color:#888; font-size:13px;">
+    <div style="text-align:center; color:#888; font-size:13px; margin:0; padding:0;">
         Built with Gradio &middot; Python &middot; HuggingFace LLMs &nbsp;&middot;&nbsp;
         <a href="https://github.com/kduffuor/ResumeIQ" target="_blank"
            style="color:#888; text-decoration:none;">GitHub</a> &nbsp;&middot;&nbsp;
         <a href="https://linkedin.com/in/kduffuor" target="_blank"
            style="color:#888; text-decoration:none;">LinkedIn</a>
     </div>
-    """)
+    """, elem_id="footer")
 
 if __name__ == "__main__":
     if os.environ.get("SPACE_ID"):
